@@ -1,1 +1,4 @@
-# GovRAG: AI-Powered MCQ Generator for PDFs
+
+# GovRAG
+
+AI-powered MCQ Generator for PDFs using LLMs, OCR and FastAPI.
