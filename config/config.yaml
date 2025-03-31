@@ -1,0 +1,20 @@
+ingestion:
+  sample_pdf_folder: "~/Documents/govrag/samples"
+
+ocr:
+  dpi: 300
+  language: "en"
+
+embedding:
+  model_name: "all-MiniLM-L6-v2"  # Adjust if you have a different SentenceTransformers model
+
+index:
+  embedding_dim: 384
+
+mcq_generator:
+  model_path: "/path/to/llama3"
+  max_length: 256
+
+api:
+  host: "0.0.0.0"
+  port: 8000
