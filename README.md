@@ -21,30 +21,37 @@ Built to work with dense regulatory documents where hallucination is not accepta
 - Ollama for LLM inference (qwen3:8b default, swap to anything)
 - PyMuPDF for PDF parsing, pytesseract for OCR fallback
 
-## Quick start
+## Quick start (local)
 
 ```bash
-# Install
+# Start Postgres with pgvector + the API
+docker compose up
+
+# Or manually:
 pip install -r requirements.txt
-
-# Start Postgres with pgvector
-docker run -d \
-  -e POSTGRES_PASSWORD=govrag \
-  -p 5432:5432 \
-  pgvector/pgvector:pg16
-
-# Pull an LLM
+docker run -d -e POSTGRES_PASSWORD=govrag -p 5432:5432 pgvector/pgvector:pg16
 ollama pull qwen3:8b
-
-# Run
 uvicorn api.main:app --reload
 ```
 
-Open http://localhost:8000/docs for the Swagger UI, or use Docker Compose:
+Open http://localhost:8000/docs for the Swagger UI.
 
-```bash
-docker compose up
+## Deploy to Railway (cloud)
+
+Railway supports Docker and managed Postgres with pgvector — the right fit for this stack.
+
+1. Fork this repo and create a new project at [railway.app](https://railway.app)
+2. Add a **Postgres** plugin — Railway sets `DATABASE_URL` automatically
+3. Set these environment variables in your Railway service:
+
 ```
+LLM_PROVIDER=groq
+GROQ_API_KEY=<your key from console.groq.com — free tier works>
+```
+
+4. Deploy. Railway picks up `railway.json` and uses the Dockerfile.
+
+> Ollama can't run on Railway (no GPU, no persistent process). Groq gives you llama-3.3-70b for free via API — same quality, zero setup.
 
 ## API
 

@@ -1,14 +1,13 @@
 import os
-import json
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import httpx
 import uvicorn
 
+from api import llm
 from ingestion.pdf_ingest import ingest_pdf
 from chunking.chunker import chunk_text_sentences, chunk_text
 from embeddings.embedder import Embedder
@@ -18,7 +17,6 @@ from storage.pgvector_store import (
 )
 from question_generation.mcq_generator import MCQGenerator
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 app = FastAPI(
@@ -109,7 +107,7 @@ async def ask(req: AskRequest):
         f"[{c.doc_name}, p.{c.page}]\n{c.text}" for c in chunks
     )
     prompt = _build_prompt(req.question, context)
-    answer = await _call_ollama(prompt)
+    answer = await _call_llm(prompt)
 
     return {
         "answer": answer,
@@ -132,22 +130,8 @@ async def ask_stream(question: str, doc_id: int | None = None, k: int = 5):
     prompt = _build_prompt(question, context)
 
     async def generate() -> AsyncGenerator[str, None]:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
-                "POST",
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True},
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            if token := data.get("response"):
-                                yield token
-                            if data.get("done"):
-                                break
-                        except json.JSONDecodeError:
-                            pass
+        async for token in llm.stream(prompt):
+            yield token
 
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -171,14 +155,8 @@ Question: {question}
 Answer:"""
 
 
-async def _call_ollama(prompt: str) -> str:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-        )
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+async def _call_llm(prompt: str) -> str:
+    return await llm.generate(prompt)
 
 
 if __name__ == "__main__":
