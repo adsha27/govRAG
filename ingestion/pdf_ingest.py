@@ -2,31 +2,46 @@ import os
 from preprocessing.text_extraction import extract_text_from_pdf
 from preprocessing.ocr import perform_ocr_on_pdf
 
-def ingest_pdf(file_path: str) -> str:
+
+def ingest_pdf(file_path: str, return_pages: bool = False):
     """
-    Ingests a PDF file and returns its extracted text.
-    It first attempts digital text extraction; if that fails,
-    it falls back to OCR extraction.
+    Ingest a PDF. Returns text string, or (text, pages) if return_pages=True.
+    pages is a list of (page_num, page_text) tuples.
+    Falls back to OCR if digital extraction yields nothing.
     """
-    text = extract_text_from_pdf(file_path)
-    if not text or len(text.strip()) == 0:
+    pages = _extract_pages(file_path)
+
+    if not pages:
         print(f"Digital extraction failed for {file_path}. Falling back to OCR...")
-        text = perform_ocr_on_pdf(file_path)
-    return text
+        full_text = perform_ocr_on_pdf(file_path)
+        if return_pages:
+            return full_text, [(0, full_text)]
+        return full_text
 
-def ingest_sample_pdf():
-    """
-    Ingests the sample PDF file located at govrag/samples/weinberg1.pdf.
-    """
-    base_path = os.path.expanduser("~/Documents/govrag/samples")
-    sample_file = os.path.join(base_path, "weinberg1.pdf")
-    if not os.path.exists(sample_file):
-        print(f"Sample file not found: {sample_file}")
-        return None
-    return ingest_pdf(sample_file)
+    full_text = " ".join(text for _, text in pages)
 
-if __name__ == "__main__":
-    extracted_text = ingest_sample_pdf()
-    if extracted_text:
-        print("Extracted Text Preview:")
-        print(extracted_text[:500])
+    if return_pages:
+        return full_text, pages
+    return full_text
+
+
+def _extract_pages(file_path: str) -> list[tuple[int, str]]:
+    """Extract per-page text using PyMuPDF if available, else fallback."""
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(file_path)
+        pages = []
+        for i, page in enumerate(doc):
+            text = page.get_text().strip()
+            if text:
+                pages.append((i + 1, text))
+        doc.close()
+        return pages
+    except ImportError:
+        pass
+
+    # Fallback: extract all text without page tracking
+    text = extract_text_from_pdf(file_path)
+    if text and text.strip():
+        return [(1, text)]
+    return []

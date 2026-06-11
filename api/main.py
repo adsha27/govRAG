@@ -1,74 +1,155 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-import uvicorn
 import os
+import json
+from typing import AsyncGenerator
 
-# FastAPI CORS middleware
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import httpx
+import uvicorn
 
-# Local imports for your modules
 from ingestion.pdf_ingest import ingest_pdf
-from chunking.chunker import chunk_text
+from chunking.chunker import chunk_text_sentences, chunk_text
 from embeddings.embedder import Embedder
-from index.indexer import VectorIndexer
+from storage.pgvector_store import (
+    init_db, add_document, add_chunks, search,
+    list_documents, delete_document
+)
 from question_generation.mcq_generator import MCQGenerator
 
-# Initialize FastAPI app
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+
 app = FastAPI(
-    title="GovRAG API",
-    description="API for document ingestion, semantic search, and MCQ generation.",
+    title="govRAG",
+    description="RAG over government and policy documents. Upload PDFs, ask questions, get cited answers.",
+    version="2.0.0",
 )
 
-# CORS setup for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load backend components
 embedder = Embedder()
-indexer = VectorIndexer(embedding_dim=384)
-mcq_generator = MCQGenerator(model_name="llama3")
+mcq_generator = MCQGenerator(model_name=OLLAMA_MODEL)
+
+
+@app.on_event("startup")
+async def startup():
+    init_db()
 
 
 @app.get("/")
 def root():
-    return {"message": "✅ GovRAG API is live. Visit /docs for Swagger."}
+    return {"status": "ok", "version": "2.0.0", "docs": "/docs"}
 
 
 @app.post("/ingest/")
 async def ingest_document(file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
-    
-    temp_file = f"temp_{file.filename}"
-    with open(temp_file, "wb") as f:
+        raise HTTPException(400, "Upload a PDF file")
+
+    tmp_path = f"/tmp/upload_{file.filename}"
+    with open(tmp_path, "wb") as f:
         f.write(await file.read())
 
-    text = ingest_pdf(temp_file)
-    os.remove(temp_file)
+    try:
+        result = ingest_pdf(tmp_path)
+        if isinstance(result, tuple):
+            text, pages = result
+        else:
+            text, pages = result, None
+    finally:
+        os.remove(tmp_path)
 
-    chunks = chunk_text(text)
+    doc_id = add_document(file.filename)
+
+    try:
+        chunks, chunk_pages = chunk_text_sentences(text, pages)
+    except Exception:
+        chunks = chunk_text(text)
+        chunk_pages = [0] * len(chunks)
+
     embeddings = embedder.encode(chunks)
-    indexer.add_bulk(embeddings, chunks)
+    add_chunks(doc_id, file.filename, chunks, embeddings, chunk_pages)
+
+    return {"doc_id": doc_id, "doc_name": file.filename, "num_chunks": len(chunks)}
+
+
+@app.get("/docs/")
+def list_docs():
+    return list_documents()
+
+
+@app.delete("/docs/{doc_id}/")
+def delete_doc(doc_id: int):
+    delete_document(doc_id)
+    return {"deleted": doc_id}
+
+
+class AskRequest(BaseModel):
+    question: str
+    doc_id: int | None = None
+    k: int = 5
+
+
+@app.post("/ask/")
+async def ask(req: AskRequest):
+    query_emb = embedder.encode([req.question])[0]
+    chunks = search(query_emb, k=req.k, doc_id=req.doc_id)
+
+    if not chunks:
+        raise HTTPException(404, "No relevant chunks found. Ingest documents first.")
+
+    context = "\n\n".join(
+        f"[{c.doc_name}, p.{c.page}]\n{c.text}" for c in chunks
+    )
+    prompt = _build_prompt(req.question, context)
+    answer = await _call_ollama(prompt)
 
     return {
-        "message": "Document ingested and indexed successfully.",
-        "num_chunks": len(chunks)
+        "answer": answer,
+        "sources": [
+            {"chunk": c.text[:200], "doc_name": c.doc_name, "page": c.page, "score": round(c.score, 3)}
+            for c in chunks
+        ],
     }
 
 
-@app.get("/search/")
-def search(query: str, k: int = 5):
-    query_embedding = embedder.encode([query])[0]
-    distances, results = indexer.search(query_embedding, k)
-    return {
-        "query": query,
-        "results": results,
-        "distances": distances.tolist()
-    }
+@app.get("/ask/stream/")
+async def ask_stream(question: str, doc_id: int | None = None, k: int = 5):
+    query_emb = embedder.encode([question])[0]
+    chunks = search(query_emb, k=k, doc_id=doc_id)
+
+    if not chunks:
+        raise HTTPException(404, "No relevant chunks found")
+
+    context = "\n\n".join(f"[{c.doc_name}, p.{c.page}]\n{c.text}" for c in chunks)
+    prompt = _build_prompt(question, context)
+
+    async def generate() -> AsyncGenerator[str, None]:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True},
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            if token := data.get("response"):
+                                yield token
+                            if data.get("done"):
+                                break
+                        except json.JSONDecodeError:
+                            pass
+
+    return StreamingResponse(generate(), media_type="text/plain")
 
 
 @app.post("/generate_mcq/")
@@ -77,34 +158,27 @@ def generate_mcq(prompt: str):
     return {"prompt": prompt, "mcq": mcq}
 
 
-@app.post("/upload_and_generate_mcqs/")
-async def upload_and_generate_mcqs(file: UploadFile = File(...)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
-    
-    temp_file = f"temp_{file.filename}"
-    with open(temp_file, "wb") as f:
-        f.write(await file.read())
+def _build_prompt(question: str, context: str) -> str:
+    return f"""Answer based only on the document excerpts below.
+If the answer is not in the excerpts, say that directly.
+Do not make up information. Cite source and page when relevant.
 
-    text = ingest_pdf(temp_file)
-    os.remove(temp_file)
+Excerpts:
+{context}
 
-    chunks = chunk_text(text)
+Question: {question}
 
-    mcq_list = []
-    for i, chunk in enumerate(chunks):
-        if i >= 10:
-            break
+Answer:"""
 
-        chunk = chunk[:1000]  # Limit for faster response + shorter prompt
-        print(f"[INFO] Generating MCQ {i + 1}/10...")
-        mcq = mcq_generator.generate_mcq(chunk)
-        mcq_list.append({"chunk_index": i, "mcq": mcq})
 
-    return {
-        "num_chunks": len(chunks),
-        "mcqs": mcq_list
-    }
+async def _call_ollama(prompt: str) -> str:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip()
 
 
 if __name__ == "__main__":
