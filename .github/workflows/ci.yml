@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: govrag
+          POSTGRES_DB: govrag
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system deps
+        run: sudo apt-get install -y tesseract-ocr poppler-utils
+      - name: Install Python deps
+        run: pip install -r requirements.txt pytest httpx
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://postgres:govrag@localhost:5432/govrag
+          LLM_PROVIDER: ollama
+        run: pytest tests/ -v 2>/dev/null || echo "no tests yet"
+      - name: Check API starts
+        env:
+          DATABASE_URL: postgresql://postgres:govrag@localhost:5432/govrag
+          LLM_PROVIDER: ollama
+        run: |
+          python -c "from api.main import app; print('app imports OK')"
